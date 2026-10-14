@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.vscode/
+.hypothesis/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Native and GPU build artifacts
+build/
+dist/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.cubin
+*.fatbin
+
+# PyTorch extensions and compiler caches
+.torch_extensions/
+torch_extensions/
+.triton/
+
+# Test, benchmark, and profiling output
+.cache/
+logs/
+results/
+benchmark_results/
+*.log
+*.prof
+*.nsys-rep
+*.ncu-rep
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
