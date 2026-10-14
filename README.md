@@ -1,14 +1,6 @@
 # KernelForge
 
-Custom GPU kernels for neural network operators and modules. The repository is updated periodically as new kernels and optimizations are added.
-
-Kernels are currently implemented primarily with [TileLang](https://github.com/tile-ai/tilelang).
-
-## Results
-
-| Module | Average speedup | Core optimization |
-| --- | ---: | --- |
-| [RMSNorm](rmsnorm/) | 5.71x vs. PyTorch | Single-pass scan that retains loaded values for normalization and weighting |
+Custom GPU kernels for neural network operators and modules. The repository is updated periodically as new kernels and optimizations are added. Kernels are currently implemented primarily with [TileLang](https://github.com/tile-ai/tilelang).
 
 ## Layout
 
@@ -23,3 +15,11 @@ kernel_name/
 ```
 
 Tests compare `custom.py` with `original.py` for correctness and speed using identical inputs, shapes, data types, and device settings. GPU benchmarks must include warm-up iterations and synchronization.
+
+## Results
+
+| Module | Average Speedup | Core Optimization |
+| :--- | ---: | :--- |
+| **[RMSNorm](rmsnorm/)** | **5.71x** | Single-pass scan with retained input values for normalization and weighting |
+
+*Measured against PyTorch eager inference with `torch.inference_mode()`. See the module README for benchmark details.*
