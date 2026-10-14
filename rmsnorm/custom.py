@@ -4,8 +4,8 @@ import torch
 import torch.nn as nn
 
 
-RSMNORM_THREADS = 128
-RSMNORM_WARP_SIZE = 32
+THREADS = 128
+WARP_SIZE = 32
 
 
 @tilelang.jit(
@@ -19,8 +19,8 @@ def rms_norm(
     eps: float = 1e-6,
     dtype: str = "bfloat16",
 ):
-    values_per_thread = (dim + RSMNORM_THREADS - 1) // RSMNORM_THREADS
-    num_warps = RSMNORM_THREADS // RSMNORM_WARP_SIZE
+    values_per_thread = (dim + THREADS - 1) // THREADS
+    num_warps = THREADS // WARP_SIZE
 
     @T.prim_func
     def main(
@@ -28,7 +28,7 @@ def rms_norm(
         Weight: T.Tensor((dim,), dtype),
         Output: T.Tensor((batch, seq_len, dim), dtype),
     ):
-        with T.Kernel(batch * seq_len, threads=RSMNORM_THREADS) as row:
+        with T.Kernel(batch * seq_len, threads=THREADS) as row:
             thread_idx = T.get_thread_binding(0)
             x_local = T.alloc_local((values_per_thread,), "float")
             thread_sum = T.alloc_local((1,), "float")
@@ -40,18 +40,18 @@ def rms_norm(
             thread_sum[0] = 0.0
 
             for i in T.Unroll(values_per_thread):
-                col = i * RSMNORM_THREADS + thread_idx
+                col = i * THREADS + thread_idx
                 x_local[i] = 0.0
                 if col < dim:
                     x_local[i] = T.Cast("float", X[batch_idx, seq_idx, col])
                     thread_sum[0] += x_local[i] * x_local[i]
 
             thread_sum[0] = T.warp_reduce_sum(thread_sum[0])
-            if thread_idx % RSMNORM_WARP_SIZE == 0:
-                warp_sums[thread_idx // RSMNORM_WARP_SIZE] = thread_sum[0]
+            if thread_idx % WARP_SIZE == 0:
+                warp_sums[thread_idx // WARP_SIZE] = thread_sum[0]
             T.sync_threads()
 
-            if thread_idx < RSMNORM_WARP_SIZE:
+            if thread_idx < WARP_SIZE:
                 block_sum[0] = 0.0
                 if thread_idx < num_warps:
                     block_sum[0] = warp_sums[thread_idx]
@@ -61,7 +61,7 @@ def rms_norm(
             T.sync_threads()
 
             for i in T.Unroll(values_per_thread):
-                col = i * RSMNORM_THREADS + thread_idx
+                col = i * THREADS + thread_idx
                 if col < dim:
                     x_local[i] = T.Cast(
                         "float",

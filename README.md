@@ -20,6 +20,6 @@ Tests compare `custom.py` with `original.py` for correctness and speed using ide
 
 | Module | Average Speedup | Core Optimization |
 | :--- | ---: | :--- |
-| **[RMSNorm](rmsnorm/)** | **5.71x** | Single-pass scan with retained input values for normalization and weighting |
+| **[RMSNorm](https://arxiv.org/pdf/1910.07467)** | **5.71x** | Single-pass scan with retained input values for normalization and weighting |
 
 *Measured against PyTorch eager inference with `torch.inference_mode()`. See the module README for benchmark details.*
