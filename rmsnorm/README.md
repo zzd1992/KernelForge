@@ -79,25 +79,25 @@ Run:
 ```bash
 for seq_len in 256 1024 4096; do
   for dim in 128 512 2048; do
-    python -m rmsnorm.test --batch 1 --seq-len "$seq_len" --dim "$dim"
+    python -m rmsnorm.test --batch 1 --seq-len "$seq_len" --dim "$dim" --warmup 100
   done
 done
 ```
 
-Measured on an NVIDIA RTX 6000D with `batch=1`, `bfloat16` inputs, 25 warm-up iterations, and 100 timed iterations. The PyTorch baseline runs eagerly under `torch.inference_mode()`.
+Measured on an NVIDIA RTX 6000D with `batch=1`, `bfloat16` inputs, 100 warm-up iterations, and 100 timed iterations. The PyTorch baseline runs eagerly under `torch.inference_mode()`.
 
 | Sequence length | Dim | PyTorch | Original TileLang | Custom TileLang |
 | ---: | ---: | ---: | ---: | ---: |
-| 256 | 128 | 75.98 us | 36.31 us | 13.51 us |
-| 256 | 512 | 70.07 us | 38.20 us | 15.83 us |
-| 256 | 2048 | 93.91 us | 58.45 us | 16.41 us |
-| 1024 | 128 | 66.62 us | 30.54 us | 11.44 us |
-| 1024 | 512 | 45.92 us | 26.66 us | 9.62 us |
-| 1024 | 2048 | 43.77 us | 25.84 us | 9.20 us |
-| 4096 | 128 | 52.45 us | 28.36 us | 10.94 us |
-| 4096 | 512 | 63.70 us | 35.20 us | 13.11 us |
-| 4096 | 2048 | 112.26 us | 52.50 us | 10.54 us |
+| 256 | 128 | 49.91 us | 28.11 us | 10.03 us |
+| 256 | 512 | 42.31 us | 26.17 us | 9.20 us |
+| 256 | 2048 | 62.71 us | 33.16 us | 13.06 us |
+| 1024 | 128 | 48.17 us | 26.81 us | 9.88 us |
+| 1024 | 512 | 74.50 us | 39.09 us | 17.29 us |
+| 1024 | 2048 | 61.71 us | 28.96 us | 10.90 us |
+| 4096 | 128 | 55.15 us | 31.05 us | 12.35 us |
+| 4096 | 512 | 48.00 us | 28.47 us | 10.15 us |
+| 4096 | 2048 | 113.10 us | 52.64 us | 12.86 us |
 
-Across these nine shapes, the custom kernel is **5.71x faster than PyTorch** and **3.02x faster than the original TileLang implementation** on average. Each average is the arithmetic mean of the per-shape speedup ratios.
+Across these nine shapes, the custom kernel is **5.25x faster than PyTorch** and **2.80x faster than the original TileLang implementation** on average. Each average is the arithmetic mean of the per-shape speedup ratios.
 
 Results depend on GPU hardware, software versions, and tensor shapes.
