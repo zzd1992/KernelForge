@@ -29,8 +29,11 @@ natural-log LSE, then compute
 $$
 \dot S=\gamma(\dot QK^\top+Q\dot K^\top),\qquad
 H=P\odot\dot S,\qquad
-\dot O=P\dot V+HV-\operatorname{rowsum}(H)\odot O.
+\dot O=P\dot V+HV-(H\mathbf{1})\odot O.
 $$
+
+Here, $\mathbf{1}$ is a column vector of ones. $H\mathbf{1}$ gives the row sums
+of $H$, which are broadcast across the output feature dimension.
 
 The kernel streams key tiles while retaining Q/dQ in shared memory. It performs
 five Tensor Core GEMMs per key tile and accumulates scores, row corrections,
