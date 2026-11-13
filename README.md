@@ -21,5 +21,5 @@ Tests compare `custom.py` with `original.py` for correctness and speed using ide
 | Module | Baseline | Average Speedup | Core Optimization |
 | :--- | :--- | ---: | :--- |
 | **[RMSNorm](https://arxiv.org/pdf/1910.07467)** | PyTorch eager | **5.25x** | Two-pass scan to One-pass scan |
-| **[SANA Linear Attention](SANA_LinearAttention/README.md)** | `torch.compile` | **2.28x** attn_matmul <br>**1.04x** end-to-end | Tiled linear-attention accumulation with sequence splitting |
+| **[SANA Linear Attention](SANA_LinearAttention/README.md)** | `torch.compile` | **2.28x** attn <br>**1.04x** end2end | Tiled linear-attention accumulation with sequence splitting |
 | **[FlashAttention JVP](flash_attention_jvp/README.md)** | PyTorch dense JVP | **9.79x** | Independent JVP reusing native O/LSE |
