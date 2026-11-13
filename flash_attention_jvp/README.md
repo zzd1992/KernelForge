@@ -37,12 +37,19 @@ five Tensor Core GEMMs per key tile and accumulates scores, row corrections,
 and output tangents in FP32. P/H tiles are cast to BF16 for Tensor Core
 multiplication. It stores no full attention matrix in HBM.
 
-Tile sizes, thread count, and pipeline depth are jointly autotuned, with
-shared-memory and FP32 fragment pressure pruning. `T.Pipelined` schedules
-asynchronous KV prefetch and shared-memory buffering. Candidates are checked
-using the caller's real inputs and cached O/LSE before CUDA Graph profiling.
-Selected code/configurations are cached in memory and on disk. Warm up a shape
-before CUDA Graph capture.
+Production calls use deterministic settings taken from the H20 tuning results:
+the default `(block_m, block_n, threads, num_stages)` is `(64,64,128,2)`.
+Non-causal key lengths of at least 8192 use one pipeline stage. Short scans
+that fit in one key tile also use one stage. Head dimensions above 128 use
+`(64,32,256)` tiles/threads to reduce shared-memory usage.
+
+`T.Pipelined` schedules asynchronous KV prefetch and shared-memory buffering.
+`custom.py` has no runtime autotuner, application-managed kernel/configuration
+cache, cache keys, locks, or persistence callbacks. Compilation is handled by
+the standard TileLang JIT; warm up a shape before CUDA Graph capture.
+`get_jvp_config` reports default settings immediately, before any kernel launch.
+Each explicitly supplied schedule argument overrides its default. The optional
+offline schedule search is isolated in `test.py` (`--tune`).
 
 ## Usage
 
@@ -79,13 +86,20 @@ Cached O/LSE must match the same primals, scale, and mask used for JVP.
 
 For all four sequence lengths, standalone JVP and the complete operator's
 `torch.func.jvp` tangent passed comparison against dense PyTorch references
-with `atol=3e-2, rtol=3e-2`. Fixed-versus-tuned JVP comparisons also passed.
+with `atol=3e-2, rtol=3e-2`. Old-fixed-versus-default JVP comparisons also passed.
+
+The static-default implementation passes 47 correctness tests, including both
+causal modes, FP16/BF16, head padding, GQA, native backward, both forward-mode
+AD interfaces, explicit pipeline overrides, and graph replay with updated
+tangent data. Package import and standalone `custom.py` import were verified
+from outside the repository directory.
 
 All timings below are in microseconds, measured using CUDA events with
 synchronization and fixed-input CUDA Graph replay. Each implementation has
 20 function warm-ups before capture and 20 replay warm-ups, followed by the
-median of 5 batches of 100 replays. Compilation, autotuning, and capture are
-excluded. The two comparison tables were measured in separate invocations.
+median of 5 batches of 100 replays. These results were recorded during the
+earlier tuning runs, using the configurations now deployed as static defaults.
+Compilation, tuning, and capture are excluded from the recorded timings.
 
 ### Against Dense PyTorch
 
@@ -105,7 +119,7 @@ inputs/outputs; TF32 is disabled.
 The arithmetic mean standalone speedup across these four sequence lengths is
 **9.79x**.
 
-### Selected Configurations
+### Default Configurations
 
 | N | Query tile | Key tile | Threads | Pipeline stages |
 | ---: | ---: | ---: | ---: | ---: |
@@ -114,9 +128,8 @@ The arithmetic mean standalone speedup across these four sequence lengths is
 | 4096 | 64 | 64 | 128 | 2 |
 | 8192 | 64 | 64 | 128 | 1 |
 
-The `N=8192` search selects one pipeline stage, while the shorter tested
-sequences select two. Increasing pipeline depth is not uniformly beneficial
-as sequence length grows.
+The recorded `N=8192` winner uses one pipeline stage, while the shorter tested
+sequences use two; these choices are now encoded in the default dispatch.
 
 ## Reproduction
 
@@ -125,7 +138,6 @@ Run from the repository root:
 ```bash
 export CUDA_HOME=/usr/local/cuda-12.1
 export PATH="$CUDA_HOME/bin:$PATH"
-export TILELANG_AUTO_TUNING_CPU_COUNTS=4
 
 python -m flash_attention_jvp.test --benchmark --cuda-graph \
   --dtype bfloat16 --batch 1 --heads 16 --dim 64 \

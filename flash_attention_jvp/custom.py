@@ -1,78 +1,12 @@
 """FlashAttention forward/backward with a separate TileLang forward-mode rule."""
 
-import hashlib
-import inspect
-import json
 import math
-import threading
-from functools import lru_cache
 
 import tilelang
 import tilelang.language as T
 import torch
 from flash_attn.flash_attn_interface import _flash_attn_backward, _flash_attn_forward
-from tilelang.autotuner import AutoTuner
 from torch.autograd.function import once_differentiable
-
-
-_TUNED_KERNELS = {}
-_TUNE_LOCK = threading.Lock()
-
-
-class _JVPAutoTuner(AutoTuner):
-    def generate_cache_key(self, parameters, extra_parameters):
-        # TileLang disables persistent caching for arbitrary supply/reference
-        # callbacks. Ours have fixed semantics: the caller's read-only buffers
-        # and the same 16x32 reference kernel. Give that controlled protocol an
-        # explicit identity; cache compiled code/configuration, never tensors.
-        identity = dict(
-            protocol="kernelforge-jvp-real-inputs-v1",
-            kernel=inspect.getsource(_attention_jvp_kernel.func),
-            search=inspect.getsource(_jvp_configs),
-            parameters=self._kernel_parameters,
-            extra=extra_parameters,
-            configs=self.configs,
-            compile=hash(self.compile_args),
-            profile=hash(self.profile_args),
-            tilelang=tilelang.__version__,
-            torch=torch.__version__,
-            cuda=torch.version.cuda,
-        )
-        return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
-
-
-@lru_cache(maxsize=None)
-def _device_info(device):
-    props = torch.cuda.get_device_properties(device)
-    return props.name, props.major, props.minor, props.multi_processor_count
-
-
-def _jvp_configs(queries, keys, dim, capability, causal=False):
-    """Prune tiles by useful work, shared-memory footprint, and FP32 live state."""
-    padded_dim = max(32, 1 << (dim - 1).bit_length())
-    shared_limit = {(9, 0): 227 * 1024, (8, 0): 163 * 1024}.get(capability, 99 * 1024)
-    query_tiles = (16, 32) if queries <= 32 else (32, 64) if queries <= 128 else (32, 64, 128)
-    key_tiles = (32, 64) if keys <= 64 or padded_dim == 256 else (64, 128)
-    # TileLang 0.1.15 cannot lower some long, CTA-dependent causal bounds at
-    # depth three (tirx.Sub -> IntImm). Avoid those compiler-invalid trials.
-    pipeline_stages = (1, 2) if causal else (1, 2, 3)
-    configs = []
-    for bm in query_tiles:
-        for bn in key_tiles:
-            # A 16-row/8-warp score layout cannot lower the row reduction in
-            # TileLang 0.1.15. Keep 16-row schedules at four warps.
-            for threads in ((128, 256) if bm >= 64 or bm >= 32 and bn == 128 else (128,)):
-                # Leave register headroom for operands, reduction and address math.
-                if (2 * bm * bn + bm * padded_dim) / threads > 128:
-                    continue
-                for stages in pipeline_stages:
-                    if stages > 1 and keys <= bn or stages > 2 and keys <= 2 * bn:
-                        continue
-                    shared_bytes = 2 * (2 * bm * padded_dim + 4 * stages * bn * padded_dim + 2 * bm * bn)
-                    if shared_bytes + 8192 > shared_limit:
-                        continue
-                    configs.append(dict(block_m=bm, block_n=bn, threads=threads, num_stages=stages))
-    return configs
 
 
 @tilelang.jit(out_idx=[-1], target="cuda")
@@ -86,10 +20,10 @@ def _attention_jvp_kernel(
     dtype: str,
     scale: float,
     causal: bool,
-    block_m: int = 32,
+    block_m: int = 64,
     block_n: int = 64,
     threads: int = 128,
-    num_stages: int = 1,
+    num_stages: int = 2,
 ):
     """Return only dO; O and natural-log LSE come from FlashAttention forward."""
     padded_dim = max(32, 1 << (dim - 1).bit_length())
@@ -186,61 +120,18 @@ def _attention_jvp_kernel(
     return main
 
 
-def _kernel_args(q, k, scale, causal):
-    return (
-        q.shape[0], q.shape[1], k.shape[1], q.shape[2], k.shape[2], q.shape[3],
-        "float16" if q.dtype == torch.float16 else "bfloat16", scale, bool(causal),
-    )
-
-
-def _config_key(q, k, scale, causal):
-    return (_kernel_args(q, k, scale, causal), q.device.index, _device_info(q.device.index))
+def _default_jvp_config(dim, keys, causal):
+    # Recorded H20 defaults. Narrower key tiles keep padded D=256 within
+    # shared-memory capacity; short scans do not need multistage prefetch.
+    block_n, threads = (32, 256) if dim > 128 else (64, 128)
+    stages = 1 if keys <= block_n or (not causal and keys >= 8192) else 2
+    return dict(block_m=64, block_n=block_n, threads=threads, num_stages=stages)
 
 
 def get_jvp_config(q, k, v, *, softmax_scale=None, causal=False):
-    """Return the cached autotuned schedule, or None if this shape is not warm."""
-    scale = _validate_inputs(q, k, v, softmax_scale)
-    kernel = _TUNED_KERNELS.get(_config_key(q, k, scale, causal))
-    return None if kernel is None else dict(kernel.config)
-
-
-def _tune_jvp_kernel(inputs, scale, causal):
-    """Use TileLang's persistent tuner with real inputs, not random LSE/O."""
-    q, k = inputs[:2]
-    args = _kernel_args(q, k, scale, causal)
-    info = _device_info(q.device.index)
-    configs = _jvp_configs(q.shape[1], k.shape[1], q.shape[3], (info[1], info[2]), causal)
-    # Use a low-resource schedule as a validated reference on every device.
-    # Full correctness against FP64 PyTorch is separately covered in test.py.
-    reference_config = dict(block_m=16, block_n=32, threads=128, num_stages=1)
-    reference = _attention_jvp_kernel(*args, **reference_config)
-    torch.cuda.synchronize(q.device)
-    tuner = _JVPAutoTuner(_attention_jvp_kernel.func, configs)
-    tuner.set_kernel_parameters(
-        (args, (("device", q.device.index), ("gpu", info))),
-        _attention_jvp_kernel.signature.parameters,
-    )
-    def compile_candidate(**config):
-        config.pop("__pass_configs__", None)
-        return _attention_jvp_kernel(*args, **config)
-
-    def elaborate_candidate(**config):
-        config.pop("__pass_configs__", None)
-        return _attention_jvp_kernel.get_tir(*args, **config)
-
-    tuner.jit_compile = compile_candidate
-    tuner.jit_elaborate = elaborate_candidate
-    tuner.set_compile_args(out_idx=[-1], target="cuda", execution_backend="tvm_ffi")
-    atol, rtol = (3e-3, 1e-2) if q.dtype == torch.float16 else (3e-2, 3e-2)
-    tuner.set_profile_args(
-        supply_prog=lambda _: inputs, ref_prog=reference,
-        atol=atol, rtol=rtol, max_mismatched_ratio=0.0,
-        cache_input_tensors=False, backend="cudagraph", warmup=5, rep=15,
-    )
-    result = tuner.run(warmup=5, rep=15)
-    result.kernel.config = result.config
-    result.kernel.latency = result.latency
-    return result.kernel
+    """Return deterministic default settings without compiling or tuning."""
+    _validate_inputs(q, k, v, softmax_scale)
+    return _default_jvp_config(q.shape[-1], k.shape[1], causal)
 
 
 @torch.library.custom_op("kernelforge::flash_attention_jvp", mutates_args=(), device_types="cuda")
@@ -253,21 +144,11 @@ def _launch_jvp(
     # An opaque torch operator unwraps torch.func tracking tensors before the
     # external runtime accesses their storage. This also supplies a fake rule.
     with torch.cuda.device(q.device):
-        if block_m == 0:
-            key = _config_key(q, k, scale, causal)
-            kernel = _TUNED_KERNELS.get(key)
-            if kernel is None:
-                if torch.cuda.is_current_stream_capturing():
-                    raise RuntimeError("Warm up this JVP shape before CUDA Graph capture to populate its autotune cache")
-                with _TUNE_LOCK:
-                    kernel = _TUNED_KERNELS.get(key)
-                    if kernel is None:
-                        kernel = _tune_jvp_kernel((q, k, v, tq, tk, tv, out, lse), scale, causal)
-                        _TUNED_KERNELS[key] = kernel
-        else:
-            kernel = _attention_jvp_kernel(
-                *_kernel_args(q, k, scale, causal), block_m, block_n, threads, num_stages,
-            )
+        kernel = _attention_jvp_kernel(
+            q.shape[0], q.shape[1], k.shape[1], q.shape[2], k.shape[2], q.shape[3],
+            "float16" if q.dtype == torch.float16 else "bfloat16", scale, causal,
+            block_m, block_n, threads, num_stages,
+        )
         return kernel(q, k, v, tq, tk, tv, out, lse)
 
 
@@ -307,7 +188,7 @@ def _prepare_tangent(tangent, primal, name):
 @torch.no_grad()
 def flash_attention_jvp(
     q, k, v, tq, tk, tv, out, lse, *, softmax_scale=None, causal=False,
-    block_m=None, block_n=None, threads=None, num_stages=None,
+    block_m=64, block_n=None, threads=None, num_stages=None,
 ):
     """Standalone JVP using cached forward results, without a forward launch.
 
@@ -315,24 +196,25 @@ def flash_attention_jvp(
     out: [B, Nq, Hq, D]; lse: [B, Hq, Nq], float32, natural logarithms.
     out/lse must come from these same primals, scale and causal setting.
     A None tangent denotes zero. The result has q's dtype and out's shape.
-    Scheduling is autotuned on first use and cached. Setting any scheduling
-    argument bypasses tuning; unspecified arguments then use (32, 64, 128, 1).
+    Default scheduling is (64, 64, 128, 2), with one stage for short scans and
+    non-causal Nk >= 8192. Head dimensions above 128 use (64, 32, 256).
+    Explicit schedule arguments override the corresponding defaults.
     """
     scale = _validate_inputs(q, k, v, softmax_scale)
     if out.shape != q.shape or out.dtype != q.dtype or out.device != q.device:
         raise ValueError("out must have q's shape, device, and dtype")
     if lse.shape != (q.shape[0], q.shape[2], q.shape[1]) or lse.dtype != torch.float32 or lse.device != q.device:
         raise ValueError("lse must be float32 [B, Hq, Nq] on q's device")
-    if all(x is None for x in (block_m, block_n, threads, num_stages)):
-        block_m, block_n, threads, num_stages = 0, 0, 0, 0
-    else:
-        block_m = 32 if block_m is None else block_m
-        block_n = 64 if block_n is None else block_n
-        threads = 128 if threads is None else threads
-        num_stages = 1 if num_stages is None else num_stages
-        if (block_m not in (16, 32, 64, 128) or block_n not in (32, 64, 128)
-                or threads not in (128, 256) or num_stages not in (1, 2, 3)):
-            raise ValueError("unsupported tile/pipeline configuration")
+    defaults = _default_jvp_config(q.shape[-1], k.shape[1], causal)
+    block_m = defaults["block_m"] if block_m is None else block_m
+    block_n = defaults["block_n"] if block_n is None else block_n
+    if threads is None:
+        threads = 128 if block_m == 16 else defaults["threads"]
+    if num_stages is None:
+        num_stages = 1 if k.shape[1] <= block_n or (not causal and k.shape[1] >= 8192) else 2
+    if (block_m not in (16, 32, 64, 128) or block_n not in (32, 64, 128)
+            or threads not in (128, 256) or num_stages not in (1, 2, 3)):
+        raise ValueError("unsupported tile/pipeline configuration")
     q, k, v = (x.contiguous() for x in (q, k, v))
     tq, tk, tv = (_prepare_tangent(t, p, n) for t, p, n in zip((tq, tk, tv), (q, k, v), ("tq", "tk", "tv")))
     return _launch_jvp(

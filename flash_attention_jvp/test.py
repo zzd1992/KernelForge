@@ -8,14 +8,9 @@ from unittest.mock import patch
 import pytest
 import torch
 from flash_attn import flash_attn_func
-from tilelang import env as tilelang_env
 
 from .custom import (
     _attention_jvp_kernel,
-    _config_key,
-    _JVPAutoTuner,
-    _jvp_configs,
-    _TUNED_KERNELS,
     flash_attention,
     flash_attention_jvp,
     get_jvp_config,
@@ -229,34 +224,37 @@ def test_pipeline_tails_and_empty_rows(dtype, causal, stages):
         assert torch.count_nonzero(actual[:, :96]) == 0
 
 
-def test_autotune_cache_and_graph_replay():
+def test_graph_replay_with_updated_tangent():
     inputs = make_inputs((1, 67, 131, 4, 2, 64, True, None), torch.float16)
     out, lse = flash_attention(*inputs[:3], causal=True, return_lse=True)
-    actual = flash_attention_jvp(*inputs, out, lse, causal=True)
     config = get_jvp_config(*inputs[:3], causal=True)
-    assert config is not None and set(config) == {"block_m", "block_n", "threads", "num_stages"}
+    actual = flash_attention_jvp(*inputs, out, lse, causal=True)
     graph = torch.cuda.CUDAGraph()
-    with patch("flash_attention_jvp.custom._tune_jvp_kernel", side_effect=AssertionError("repeated tuning")):
-        with torch.cuda.graph(graph):
-            captured = flash_attention_jvp(*inputs, out, lse, causal=True)
-        graph.replay()
-        torch.cuda.synchronize()
-        torch.testing.assert_close(captured, actual, atol=0, rtol=0)
-        inputs[5].add_(0.03125)
-        graph.replay()
-        torch.cuda.synchronize()
-        expected = flash_attention_jvp(*inputs, out, lse, causal=True)
-        torch.testing.assert_close(captured, expected, atol=0, rtol=0)
+    with torch.cuda.graph(graph):
+        captured = flash_attention_jvp(*inputs, out, lse, causal=True)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(captured, actual, atol=0, rtol=0)
+    inputs[5].add_(0.03125)
+    graph.replay()
+    torch.cuda.synchronize()
+    expected = flash_attention_jvp(*inputs, out, lse, causal=True)
+    torch.testing.assert_close(captured, expected, atol=0, rtol=0)
     assert get_jvp_config(*inputs[:3], causal=True) == config
-    if tilelang_env.is_cache_enabled() and not tilelang_env.is_autotune_cache_disabled():
-        # Model a fresh process: remove both in-memory layers and forbid new
-        # profiling. The saved code/configuration must load from disk correctly.
-        _TUNED_KERNELS.pop(_config_key(inputs[0], inputs[1], 64 ** -0.5, True))
-        with patch.object(_JVPAutoTuner, "_memory_cache", {}):
-            with patch.object(_JVPAutoTuner, "_benchmark_target", side_effect=AssertionError("cache miss")):
-                restored = flash_attention_jvp(*inputs, out, lse, causal=True)
-        torch.testing.assert_close(restored, expected, atol=0, rtol=0)
-        assert get_jvp_config(*inputs[:3], causal=True) == config
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("causal", (False, True))
+def test_long_key_default_and_explicit_pipeline(dtype, causal):
+    inputs = make_inputs((1, 5, 8192, 2, 1, 64, causal, None), dtype)
+    out, lse = flash_attention(*inputs[:3], causal=causal, return_lse=True)
+    config = get_jvp_config(*inputs[:3], causal=causal)
+    assert config["num_stages"] == (2 if causal else 1)
+    actual = flash_attention_jvp(*inputs, out, lse, causal=causal)
+    explicit = flash_attention_jvp(*inputs, out, lse, causal=causal, num_stages=2)
+    _, reference = attention_jvp(*double_reference(inputs), causal=causal)
+    torch.testing.assert_close(actual.cpu().double(), reference, **tolerance(dtype))
+    torch.testing.assert_close(explicit.cpu().double(), reference, **tolerance(dtype))
 
 
 def benchmark_cuda(fn, warmup, iterations, repeats, *, cuda_graph=False):
@@ -335,7 +333,7 @@ def run_schedule_sweep(args):
         inputs = make_inputs((args.batch, n, n, args.heads, args.heads, args.dim, args.causal, None), dtype)
         out, lse = flash_attention(*inputs[:3], causal=args.causal, return_lse=True)
         reference = attention_jvp_from_forward(*inputs, out, lse, causal=args.causal)
-        configs = _jvp_configs(n, n, args.dim, capability, args.causal)
+        configs = _schedule_candidates(n, n, args.dim, capability, args.causal)
         print(f"N={n}, dtype={args.dtype}, D={args.dim}, causal={args.causal}, candidates={len(configs)}")
         times = []
         for config in configs:
@@ -354,14 +352,36 @@ def run_schedule_sweep(args):
         print(f"Best: {min(times, key=lambda result: result[0])}", flush=True)
 
 
+def _schedule_candidates(queries, keys, dim, capability, causal=False):
+    """Offline tuning search; production imports do not include this machinery."""
+    padded_dim = max(32, 1 << (dim - 1).bit_length())
+    shared_limit = {(9, 0): 227 * 1024, (8, 0): 163 * 1024}.get(capability, 99 * 1024)
+    query_tiles = (16, 32) if queries <= 32 else (32, 64) if queries <= 128 else (32, 64, 128)
+    key_tiles = (32, 64) if keys <= 64 or padded_dim == 256 else (64, 128)
+    pipeline_stages = (1, 2) if causal else (1, 2, 3)
+    configs = []
+    for bm in query_tiles:
+        for bn in key_tiles:
+            for threads in ((128, 256) if bm >= 64 or bm >= 32 and bn == 128 else (128,)):
+                if (2 * bm * bn + bm * padded_dim) / threads > 128:
+                    continue
+                for stages in pipeline_stages:
+                    if stages > 1 and keys <= bn or stages > 2 and keys <= 2 * bn:
+                        continue
+                    shared_bytes = 2 * (2 * bm * padded_dim + 4 * stages * bn * padded_dim + 2 * bm * bn)
+                    if shared_bytes + 8192 <= shared_limit:
+                        configs.append(dict(block_m=bm, block_n=bn, threads=threads, num_stages=stages))
+    return configs
+
+
 def run_schedule_comparison(args):
-    """Compare the former fixed schedule and autotuning on identical GPU work."""
+    """Compare the former fixed schedule and recorded defaults on identical GPU work."""
     dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[args.dtype]
     old_config = dict(block_m=32, block_n=64, threads=128, num_stages=1)
     print(f"GPU={torch.cuda.get_device_name()}, dtype={args.dtype}, B={args.batch}, H={args.heads}, "
           f"D={args.dim}, causal={args.causal}, graph=True, warmup={args.warmup}, "
           f"iterations={args.iterations}, repeats={args.repeats}")
-    print("| N | Fixed JVP us | Tuned JVP us | Speedup | Fixed forward+JVP us | Tuned forward+JVP us | Speedup |")
+    print("| N | Fixed JVP us | Default JVP us | Speedup | Fixed forward+JVP us | Default forward+JVP us | Speedup |")
     print("| ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
     for n in args.seq_lens:
         inputs = make_inputs((args.batch, n, n, args.heads, args.heads, args.dim, args.causal, None), dtype)
@@ -370,7 +390,7 @@ def run_schedule_comparison(args):
         def fixed_jvp():
             return flash_attention_jvp(*inputs, out, lse, causal=args.causal, **old_config)
 
-        def tuned_jvp():
+        def default_jvp():
             return flash_attention_jvp(*inputs, out, lse, causal=args.causal)
 
         def full(config):
@@ -378,12 +398,12 @@ def run_schedule_comparison(args):
             tangent = flash_attention_jvp(*inputs, output, stats, causal=args.causal, **config)
             return output, tangent
 
-        torch.testing.assert_close(tuned_jvp(), fixed_jvp(), **tolerance(dtype))
+        torch.testing.assert_close(default_jvp(), fixed_jvp(), **tolerance(dtype))
         times = [benchmark_cuda(fn, args.warmup, args.iterations, args.repeats, cuda_graph=True)
-                 for fn in (fixed_jvp, tuned_jvp, lambda: full(old_config), lambda: full({}))]
-        fixed, tuned, fixed_full, tuned_full = times
-        print(f"| {n} | {fixed:.2f} | {tuned:.2f} | {fixed/tuned:.2f}x | "
-              f"{fixed_full:.2f} | {tuned_full:.2f} | {fixed_full/tuned_full:.2f}x |", flush=True)
+                 for fn in (fixed_jvp, default_jvp, lambda: full(old_config), lambda: full({}))]
+        fixed, default, fixed_full, default_full = times
+        print(f"| {n} | {fixed:.2f} | {default:.2f} | {fixed/default:.2f}x | "
+              f"{fixed_full:.2f} | {default_full:.2f} | {fixed_full/default_full:.2f}x |", flush=True)
         print(f"Selected N={n}: {get_jvp_config(*inputs[:3], causal=args.causal)}", flush=True)
 
 
@@ -391,7 +411,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--benchmark", action="store_true", help="run benchmarks instead of correctness tests")
     parser.add_argument("--tune", action="store_true", help="validate and print every candidate schedule's latency")
-    parser.add_argument("--compare-schedules", action="store_true", help="graph-time fixed versus tuned schedules")
+    parser.add_argument("--compare-schedules", action="store_true", help="graph-time old fixed versus default schedules")
     parser.add_argument("--dtype", choices=("float16", "bfloat16"), default="bfloat16")
     parser.add_argument("--seq-lens", nargs="+", type=int, default=(128, 512, 1024, 2048))
     parser.add_argument("--batch", type=int, default=1)
