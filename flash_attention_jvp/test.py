@@ -90,7 +90,7 @@ def test_autograd_interfaces(dtype, causal):
     case = (1, 67, 41, 4, 2, 64, causal, 0.17)
     inputs = make_inputs(case, dtype, noncontiguous=True)
     q, k, v, tq, tk, tv = inputs
-    kwargs = dict(causal=causal, softmax_scale=case[-1], deterministic=True)
+    kwargs = dict(causal=causal, softmax_scale=case[-1])
     def fn(q, k, v):
         return flash_attention(q, k, v, **kwargs)
 

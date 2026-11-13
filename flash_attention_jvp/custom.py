@@ -227,7 +227,7 @@ class FlashAttentionFunction(torch.autograd.Function):
     """Native FlashAttention VJP plus a TileLang JVP, with torch.func support."""
 
     @staticmethod
-    def forward(q, k, v, softmax_scale, causal, deterministic):
+    def forward(q, k, v, softmax_scale, causal):
         scale = _validate_inputs(q, k, v, softmax_scale)
         out, lse, _, _ = _flash_attn_forward(
             q, k, v, dropout_p=0.0, softmax_scale=scale, causal=causal,
@@ -240,11 +240,10 @@ class FlashAttentionFunction(torch.autograd.Function):
 
     @staticmethod
     def setup_context(ctx, inputs, output):
-        q, k, v, scale, causal, deterministic = inputs
+        q, k, v, scale, causal = inputs
         out, lse = output
         ctx.softmax_scale = q.shape[-1] ** -0.5 if scale is None else float(scale)
         ctx.causal = causal
-        ctx.deterministic = deterministic
         ctx.set_materialize_grads(False)
         ctx.mark_non_differentiable(lse)
         ctx.save_for_backward(q, k, v, out, lse)
@@ -254,7 +253,7 @@ class FlashAttentionFunction(torch.autograd.Function):
     @once_differentiable
     def backward(ctx, dout, dlse):
         if dout is None:
-            return (None,) * 6
+            return (None,) * 5
         q, k, v, out, lse = ctx.saved_tensors
         dq, dk, dv = (
             torch.empty_like(x, memory_format=torch.contiguous_format) for x in (q, k, v)
@@ -263,12 +262,12 @@ class FlashAttentionFunction(torch.autograd.Function):
             dout.contiguous(), q, k, v, out, lse, dq, dk, dv,
             dropout_p=0.0, softmax_scale=ctx.softmax_scale, causal=ctx.causal,
             window_size_left=-1, window_size_right=-1, softcap=0.0,
-            alibi_slopes=None, deterministic=ctx.deterministic,
+            alibi_slopes=None, deterministic=False,
         )
-        return dq, dk, dv, None, None, None
+        return dq, dk, dv, None, None
 
     @staticmethod
-    def jvp(ctx, tq, tk, tv, tscale, tcausal, tdeterministic):
+    def jvp(ctx, tq, tk, tv, tscale, tcausal):
         q, k, v, out, lse = ctx.saved_tensors
         tangent = flash_attention_jvp(
             q, k, v, tq, tk, tv, out, lse,
@@ -277,7 +276,7 @@ class FlashAttentionFunction(torch.autograd.Function):
         return tangent, None
 
 
-def flash_attention(q, k, v, *, softmax_scale=None, causal=False, deterministic=False, return_lse=False):
+def flash_attention(q, k, v, *, softmax_scale=None, causal=False, return_lse=False):
     """Attention with native forward/backward and custom forward-mode AD.
 
     Return out by default, or (out, lse) when return_lse=True. The natural-log
@@ -287,6 +286,6 @@ def flash_attention(q, k, v, *, softmax_scale=None, causal=False, deterministic=
     """
     _validate_inputs(q, k, v, softmax_scale)
     out, lse = FlashAttentionFunction.apply(
-        q.contiguous(), k.contiguous(), v.contiguous(), softmax_scale, bool(causal), bool(deterministic)
+        q.contiguous(), k.contiguous(), v.contiguous(), softmax_scale, bool(causal)
     )
     return (out, lse) if return_lse else out
