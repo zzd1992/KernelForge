@@ -3,7 +3,6 @@
 from .custom import (
     FlashAttentionFunction,
     flash_attention,
-    flash_attention_forward,
     flash_attention_jvp,
     get_jvp_config,
 )
@@ -11,7 +10,6 @@ from .custom import (
 __all__ = [
     "FlashAttentionFunction",
     "flash_attention",
-    "flash_attention_forward",
     "flash_attention_jvp",
     "get_jvp_config",
 ]

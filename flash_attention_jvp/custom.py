@@ -395,20 +395,16 @@ class FlashAttentionFunction(torch.autograd.Function):
         return tangent, None
 
 
-def flash_attention_forward(q, k, v, *, softmax_scale=None, causal=False, deterministic=False):
-    """Return (out, lse), using the autograd operator with cached statistics."""
-    _validate_inputs(q, k, v, softmax_scale)
-    return FlashAttentionFunction.apply(
-        q.contiguous(), k.contiguous(), v.contiguous(), softmax_scale, bool(causal), bool(deterministic)
-    )
-
-
-def flash_attention(q, k, v, *, softmax_scale=None, causal=False, deterministic=False):
+def flash_attention(q, k, v, *, softmax_scale=None, causal=False, deterministic=False, return_lse=False):
     """Attention with native forward/backward and custom forward-mode AD.
 
+    Return out by default, or (out, lse) when return_lse=True. The natural-log
+    LSE is a non-differentiable auxiliary output for standalone JVP calls.
     Supports torch.func.jvp and torch.autograd.forward_ad. Dropout is fixed at
     zero. Only first-order derivatives are implemented; vmap is not registered.
     """
-    return flash_attention_forward(
-        q, k, v, softmax_scale=softmax_scale, causal=causal, deterministic=deterministic
-    )[0]
+    _validate_inputs(q, k, v, softmax_scale)
+    out, lse = FlashAttentionFunction.apply(
+        q.contiguous(), k.contiguous(), v.contiguous(), softmax_scale, bool(causal), bool(deterministic)
+    )
+    return (out, lse) if return_lse else out

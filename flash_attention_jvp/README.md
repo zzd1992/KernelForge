@@ -47,12 +47,13 @@ before CUDA Graph capture.
 ## Usage
 
 Inputs use `[B, sequence, heads, dim]` layout; LSE is FP32 `[B, heads, sequence]`.
+`flash_attention` returns `out` by default; `return_lse=True` also returns the
+non-differentiable auxiliary LSE for standalone JVP calls.
 
 ```python
 import torch
 from flash_attention_jvp import (
     flash_attention,
-    flash_attention_forward,
     flash_attention_jvp,
     get_jvp_config,
 )
@@ -67,7 +68,7 @@ tq, tk, tv = (torch.randn_like(x) for x in (q, k, v))
 out, tangent = torch.func.jvp(flash_attention, (q, k, v), (tq, tk, tv))
 
 # Standalone JVP with cached native forward results.
-out, lse = flash_attention_forward(q, k, v, causal=False)
+out, lse = flash_attention(q, k, v, causal=False, return_lse=True)
 tangent = flash_attention_jvp(q, k, v, tq, tk, tv, out, lse, causal=False)
 print(get_jvp_config(q, k, v, causal=False))
 ```

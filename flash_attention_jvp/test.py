@@ -17,7 +17,6 @@ from .custom import (
     _jvp_configs,
     _TUNED_KERNELS,
     flash_attention,
-    flash_attention_forward,
     flash_attention_jvp,
     get_jvp_config,
 )
@@ -76,7 +75,7 @@ def double_reference(inputs):
 def test_standalone_jvp(case, dtype):
     q, k, v, tq, tk, tv = make_inputs(case, dtype)
     kwargs = dict(causal=case[-2], softmax_scale=case[-1])
-    out, lse = flash_attention_forward(q, k, v, **kwargs)
+    out, lse = flash_attention(q, k, v, return_lse=True, **kwargs)
     # Assert that requesting only dO never invokes the native forward again.
     with patch("flash_attention_jvp.custom._flash_attn_forward", side_effect=AssertionError("extra forward")):
         actual = flash_attention_jvp(q, k, v, tq, tk, tv, out, lse, **kwargs)
@@ -100,30 +99,50 @@ def test_autograd_interfaces(dtype, causal):
     def fn(q, k, v):
         return flash_attention(q, k, v, **kwargs)
 
+    def fn_with_lse(q, k, v):
+        return flash_attention(q, k, v, return_lse=True, **kwargs)
+
     ref_out, ref_tangent = attention_jvp(*double_reference(inputs), causal=causal, softmax_scale=case[-1])
 
     out, tangent = torch.func.jvp(fn, (q, k, v), (tq, tk, tv))
     torch.testing.assert_close(out.cpu().double(), ref_out, **tolerance(dtype))
     torch.testing.assert_close(tangent.cpu().double(), ref_tangent, **tolerance(dtype))
+    (stats_out, lse), (stats_tangent, lse_tangent) = torch.func.jvp(fn_with_lse, (q, k, v), (tq, tk, tv))
+    torch.testing.assert_close(stats_out, out, atol=0, rtol=0)
+    torch.testing.assert_close(stats_tangent, tangent, atol=0, rtol=0)
+    assert lse.shape == (q.shape[0], q.shape[2], q.shape[1]) and lse.dtype == torch.float32
+    assert torch.count_nonzero(lse_tangent) == 0
     with torch.autograd.forward_ad.dual_level():
         duals = tuple(torch.autograd.forward_ad.make_dual(p, t) for p, t in zip((q, k, v), (tq, tk, tv)))
         dual_out = fn(*duals)
         primal, forward_tangent = torch.autograd.forward_ad.unpack_dual(dual_out)
         torch.testing.assert_close(primal, out, atol=0, rtol=0)
         torch.testing.assert_close(forward_tangent, tangent, atol=0, rtol=0)
+        dual_stats_out, dual_lse = fn_with_lse(*duals)
+        stats_primal, stats_forward_tangent = torch.autograd.forward_ad.unpack_dual(dual_stats_out)
+        lse_primal, lse_forward_tangent = torch.autograd.forward_ad.unpack_dual(dual_lse)
+        torch.testing.assert_close(stats_primal, primal, atol=0, rtol=0)
+        torch.testing.assert_close(stats_forward_tangent, forward_tangent, atol=0, rtol=0)
+        torch.testing.assert_close(lse_primal, lse, atol=0, rtol=0)
+        assert lse_forward_tangent is None
 
     primals = tuple(x.detach().requires_grad_() for x in (q, k, v))
     cotangent = torch.randn_like(out)
     actual_out = fn(*primals)
     actual_grads = torch.autograd.grad(actual_out, primals, cotangent)
+    stats_out, lse = fn_with_lse(*primals)
+    assert not lse.requires_grad
+    stats_grads = torch.autograd.grad(stats_out, primals, cotangent)
     native_out = flash_attn_func(*primals, **kwargs)
     native_grads = torch.autograd.grad(native_out, primals, cotangent)
     torch.testing.assert_close(actual_out, native_out, atol=0, rtol=0)
+    torch.testing.assert_close(stats_out, native_out, atol=0, rtol=0)
     double_primals = tuple(x.requires_grad_() for x in double_reference(primals))
     reference_out = attention(*double_primals, causal=causal, softmax_scale=case[-1])
     reference_grads = torch.autograd.grad(reference_out, double_primals, cotangent.cpu().double())
-    for actual, native, reference in zip(actual_grads, native_grads, reference_grads):
+    for actual, stats, native, reference in zip(actual_grads, stats_grads, native_grads, reference_grads):
         torch.testing.assert_close(actual, native, **tolerance(dtype))
+        torch.testing.assert_close(stats, native, **tolerance(dtype))
         torch.testing.assert_close(actual.cpu().double(), reference, **tolerance(dtype))
 
 
@@ -131,7 +150,7 @@ def test_autograd_interfaces(dtype, causal):
 def test_missing_and_value_only_tangents(dtype):
     case = (1, 35, 49, 2, 2, 64, False, None)
     q, k, v, tq, tk, tv = make_inputs(case, dtype)
-    out, lse = flash_attention_forward(q, k, v)
+    out, lse = flash_attention(q, k, v, return_lse=True)
     for tangents in ((None, None, None), (None, None, tv), (tq, None, None), (None, tk, None)):
         actual = flash_attention_jvp(q, k, v, *tangents, out, lse)
         ref_tangents = tuple(None if x is None else x.cpu().double() for x in tangents)
@@ -149,7 +168,7 @@ def test_uniform_score_shift_and_tile_sizes(dtype):
     case = (1, 39, 73, 2, 2, 64, False, None)
     q, k, v, tq, tk, tv = make_inputs(case, dtype)
     tk = torch.ones_like(k) * 0.25  # Q dK^T is constant across keys.
-    out, lse = flash_attention_forward(q, k, v)
+    out, lse = flash_attention(q, k, v, return_lse=True)
     shifted = flash_attention_jvp(q, k, v, None, tk, None, out, lse)
     torch.testing.assert_close(shifted, torch.zeros_like(shifted), **tolerance(dtype))
     _, reference = attention_jvp(*double_reference((q, k, v, tq, tk, tv)))
@@ -162,7 +181,7 @@ def test_finite_difference_and_duality():
     case = (1, 23, 31, 4, 2, 32, True, None)
     inputs = make_inputs(case, torch.float16)
     q, k, v, tq, tk, tv = inputs
-    out, lse = flash_attention_forward(q, k, v, causal=True)
+    out, lse = flash_attention(q, k, v, causal=True, return_lse=True)
     actual = flash_attention_jvp(*inputs, out, lse, causal=True)
     primals, tangents = double_reference(inputs[:3]), double_reference(inputs[3:])
     epsilon = 1e-4
@@ -180,7 +199,7 @@ def test_finite_difference_and_duality():
 def test_input_validation():
     case = (1, 9, 13, 2, 2, 64, False, None)
     q, k, v, tq, tk, tv = make_inputs(case, torch.float16)
-    out, lse = flash_attention_forward(q, k, v)
+    out, lse = flash_attention(q, k, v, return_lse=True)
     with pytest.raises(ValueError, match="lse"):
         flash_attention_jvp(q, k, v, tq, tk, tv, out, lse.half())
     with pytest.raises(ValueError, match="tq"):
@@ -200,7 +219,7 @@ def test_input_validation():
 @pytest.mark.parametrize("stages", (2, 3))
 def test_pipeline_tails_and_empty_rows(dtype, causal, stages):
     inputs = make_inputs((1, 193, 97, 4, 2, 64, causal, None), dtype)
-    out, lse = flash_attention_forward(*inputs[:3], causal=causal)
+    out, lse = flash_attention(*inputs[:3], causal=causal, return_lse=True)
     actual = flash_attention_jvp(
         *inputs, out, lse, causal=causal, block_m=32, block_n=32, threads=128, num_stages=stages,
     )
@@ -212,7 +231,7 @@ def test_pipeline_tails_and_empty_rows(dtype, causal, stages):
 
 def test_autotune_cache_and_graph_replay():
     inputs = make_inputs((1, 67, 131, 4, 2, 64, True, None), torch.float16)
-    out, lse = flash_attention_forward(*inputs[:3], causal=True)
+    out, lse = flash_attention(*inputs[:3], causal=True, return_lse=True)
     actual = flash_attention_jvp(*inputs, out, lse, causal=True)
     config = get_jvp_config(*inputs[:3], causal=True)
     assert config is not None and set(config) == {"block_m", "block_n", "threads", "num_stages"}
@@ -282,7 +301,7 @@ def run_benchmarks(args):
         inputs = make_inputs((args.batch, n, n, args.heads, args.heads, args.dim, args.causal, None), dtype)
         q, k, v, tq, tk, tv = inputs
         kwargs = dict(causal=args.causal)
-        out, lse = flash_attention_forward(q, k, v, **kwargs)
+        out, lse = flash_attention(q, k, v, return_lse=True, **kwargs)
         def standalone_custom():
             return flash_attention_jvp(*inputs, out, lse, **kwargs)
 
@@ -314,7 +333,7 @@ def run_schedule_sweep(args):
     capability = torch.cuda.get_device_capability()
     for n in args.seq_lens:
         inputs = make_inputs((args.batch, n, n, args.heads, args.heads, args.dim, args.causal, None), dtype)
-        out, lse = flash_attention_forward(*inputs[:3], causal=args.causal)
+        out, lse = flash_attention(*inputs[:3], causal=args.causal, return_lse=True)
         reference = attention_jvp_from_forward(*inputs, out, lse, causal=args.causal)
         configs = _jvp_configs(n, n, args.dim, capability, args.causal)
         print(f"N={n}, dtype={args.dtype}, D={args.dim}, causal={args.causal}, candidates={len(configs)}")
@@ -346,7 +365,7 @@ def run_schedule_comparison(args):
     print("| ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
     for n in args.seq_lens:
         inputs = make_inputs((args.batch, n, n, args.heads, args.heads, args.dim, args.causal, None), dtype)
-        out, lse = flash_attention_forward(*inputs[:3], causal=args.causal)
+        out, lse = flash_attention(*inputs[:3], causal=args.causal, return_lse=True)
 
         def fixed_jvp():
             return flash_attention_jvp(*inputs, out, lse, causal=args.causal, **old_config)
@@ -355,7 +374,7 @@ def run_schedule_comparison(args):
             return flash_attention_jvp(*inputs, out, lse, causal=args.causal)
 
         def full(config):
-            output, stats = flash_attention_forward(*inputs[:3], causal=args.causal)
+            output, stats = flash_attention(*inputs[:3], causal=args.causal, return_lse=True)
             tangent = flash_attention_jvp(*inputs, output, stats, causal=args.causal, **config)
             return output, tangent
 
